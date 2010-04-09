@@ -1,0 +1,272 @@
+#!gmake -f
+
+export _HOST_GNU_TYPE  ?= $(shell dpkg-architecture -qDEB_HOST_GNU_TYPE)
+export _BUILD_GNU_TYPE ?= $(shell dpkg-architecture -qDEB_BUILD_GNU_TYPE)
+
+IMAGEMAGICKVERSION = 6.3.7
+SOVERSION          = 10
+
+SUDO ?=
+PERL_ARCHIVE_SO := $(firstword $(shell find /usr/lib -name 'libperl.so.5.*'))
+
+ ##---##--------------------------------------------------##---##
+ #           ABOUT THIS MAKEFILE AND ITS THEORY                  
+ ##---##--------------------------------------------------##---##
+ # Perl will install the compiled parts of Image::Magick in loc
+ # like this one:
+ # /opt/cpan-installed/perl/module-lib/5.10/arch/i486-linux-gnu-thread-multi/auto/Image/Magick
+ #   We can ask CPANPLUS where installed files go and then
+ #   extrapolate from that where the "auto" part with be put;
+ #   then we can tell the IM makefile apparatus to build/inst
+ #   the package to that root location.
+
+# discover where we want to install Perl interface modules
+P_INSTALL_CONF = UNDEFINED
+PMB_CONF       = $(CURDIR)/PerlMagick/Makefile
+ifneq ($(words $(PMB_CONF)),1)
+    PMB_CONF :=$(strip $(shell perl -MFile::Spec::Unix -le 'print File::Spec::Unix->abs2rel(q|$(PMB_CONF)|)'))
+endif
+
+IM_INSTALL_TOP =
+# To set up --prefix for ./configure properly, we are going to be looking for
+# this in the contents of pmdest:
+#   INSTALLSITEARCH=/opt/cpan-installed/perl/module-lib/5.10/arch/i486-linux-gnu-thread-multi
+_sedfu := s;.*[ ]INSTALLSITEARCH=\([^ ]\+\).*;\1;
+
+
+define Perl1
+ use CPANPLUS::Backend;
+ my $gregory = CPANPLUS::Backend->new;
+ my $corso = $gregory->configure_object;
+ my $rslt;
+ for ($corso->options( type => q/conf/ )) {
+     /makemakerflags/ && ($rslt = $corso->get_conf(q|makemakerflags|));
+ }
+ if    ($rslt) { print $rslt; exit 0 }
+ else          { exit 1 }
+endef
+
+define Perl2
+  use CPAN;
+  CPAN::Config->load;
+  my ($rslt,$scan4);
+  for(keys %$CPAN::Config) {
+          next if $_ ne makepl_arg;
+          $scan4 = $CPAN::Config->{$_}
+  }
+  if (! $scan4
+      || $scan4 and
+       $scan4 !~/INSTALLSITEARCH/ and $scan4 =~/INSTALLDIRS/)
+  {
+      if ( $scan4 =~m{INSTALLDIRS=site} ) {
+          eval {use Config (q|config_re|); 1};
+          exit 1 if $@;
+          foreach my $ddir (config_re(q|installsitearch|)) {
+              $ddir =~m{\047([\S]+)\047} and $rslt = $ddir
+          }
+      }
+      exit 1 unless $rslt;
+      $rslt =~m{\047([\S]+)\047} and print qq(INSTALLSITEARCH=$1)
+  } else { print $scan4 }
+endef
+
+.PHONY: config build build-pm _debug1
+.INTERMEDIATE: # cpanp.mk
+
+cpanp.mk : pmdest
+	@if test -s $< ;then : ;else test -f $< && rm $< ; false ;fi
+	@echo >$@ "P_INSTALL_CONF := $(strip $(shell cat $<))"
+	@echo Created $@ ${eval IM_INSTALL_TOP := $(strip $(shell sed -e '$(_sedfu)' $<))/auto/Image/Magick}
+	@echo Determined " IM_INSTALL_TOP to $(IM_INSTALL_TOP)"
+
+pmdest:
+	-@perl 2>/dev/null -le '$(strip $(value Perl1))' >$@
+	@if test "\! -s $@"; then echo "Trying to get Perl inst-config from CPAN.pm ..."; \
+          perl 2>/dev/null -le '$(strip $(value Perl2))' >$@ ; fi
+
+_debug1: cpanp.mk
+	@cat $<
+
+# ****************** INCLUDE FILE SEEN BY MAKE **********************
+sinclude cpanp.mk
+# ****************** INCLUDE FILE SEEN BY MAKE **********************
+
+# How to fix up Makefile.PL.in using perl
+define fixMF_PL
+perl -pe ' \
+m{\bPERL\b} and s{\bPERL\b}{Perl}; \
+m{-I../ -I\@top_srcdir\@} and  \
+   $_ = "          q|INC|   => q|\@CPPFLAGS@|,\n"; \
+m{\047LDFLAGS\047} and  \
+   $_ = "      q|LDFLAGS|   => qq|$Config{ldflags} \@LDFLAGS@|,\n"; \
+m{\047LDDLFLAGS\047} and \
+   $_ = "    q|LDDLFLAGS|   => qq|\@MAGICK_LDFLAGS@|,\n"; \
+m{\047LIBS\047} and \
+   $_ = "         q|LIBS|   => [ \047\@MAGICK_LDFLAGS@ -lMagick -lWand\047 ],\n";'
+endef
+
+
+PerlMagick/Makefile.PL.good : PerlMagick/Makefile.PL.in .FORCE
+	@test -f "$(dir $<)/Makefile.PL" && (echo "Removing old Makefile.PL (do not panic)" \
+         && rm -v "$(dir $<)/Makefile.PL") || (true)
+	@if test -f $(dir $@)/Makefile.PL.in_old; then  \
+	     cp -vf $(dir $@)/Makefile.PL.in_old        \
+		        $(dir $@)/Makefile.PL.in;           \
+       else cp -v "$<" "${<}_old"; fi;
+	@cd $(dir $<) && cat $(notdir $<) | \
+        $(value fixMF_PL) |tee $(notdir $@) >~/tmp/rewritten_by_perl.log
+	@test "$? == 0" && (test -f "$@" && cp -v "$@" "$<") || true
+	@echo $(patsubst %.good,%.in,$@) is fixed now.
+	@rm -vf $(PMB_CONF)
+	./config.status PerlMagick/Makefile.PL
+
+PerlMagick/Makefile.PL :  PerlMagick/Makefile.PL.good
+	@./config.status $@
+
+report :
+	@echo We are working on creation of $(PMB_CONF)
+	@echo Found a probably-useable Perl solib at $(PERL_ARCHIVE_SO)
+
+NEED_ONLY_MKFP = $(if $(filter build-pm,$(MAKECMDGOALS)),$(PMB_CONF),)
+
+config config-stamp : PerlMagick/Makefile.PL.good
+	@echo Running configure ...\
+ ${eval IM_INSTALL_TOP := $(strip $(shell sed -e '$(_sedfu)' cpanp.mk))/auto/Image/Magick}
+ifeq (,$(NEED_ONLY_MKFP))
+	./configure --cache-file=imagemagick-autoconf-cache \
+ --enable-shared \
+ --prefix='$(IM_INSTALL_TOP)' \
+ --mandir=\$${prefix}/man \
+ --infodir=\$${prefix}/info \
+ --with-quantum-depth=32 \
+ --with-gs-font-dir=/usr/share/fonts/type1/gsfonts \
+ --with-magick-plus-plus=no  --with-djvu \
+ --without-dps --without-fpx --without-perl \
+ --x-includes=/usr/include/X11 --x-libraries=/usr/lib/X11\
+ && touch config-stamp
+endif
+
+# Patch the generated libtool to avoid passing -rpath when linking,
+# and to explicitly link libraries against the libraries they
+# depend on.
+_sed_expr1 = s/^hardcode_libdir_flag_spec.*$$/hardcode_libdir_flag_spec=" -D__LIBTOOL_IS_A_FOOL__ "/
+_sed_expr2 = /^archive_cmds="/s/"$$/ \\$$deplibs"/
+# "
+
+libtool-ok : config-stamp
+	sed < libtool > libtool-2 -e '$(_sed_expr1)' -e '$(_sed_expr2)'
+	@mv libtool-2 libtool
+	@chmod 755 libtool && touch $@
+
+# what to build to satisfy PerlMagick. we find out by simulating a build using
+# the "real" makefile an certain flags to gmake.
+pm-targnames.mk :  pmdest 
+	@gmake -np -f Makefile all-local \
+| egrep '\binstall-.*LTLIBRARIES:' \
+| sed -e 's;\([^:]\+\):;\1 =;' \
+| tee $@
+
+# ****************** INCLUDE FILE SEEN BY MAKE **********************
+sinclude pm-targnames.mk
+# ****************** INCLUDE FILE SEEN BY MAKE **********************
+
+
+build-stamp build $(PMB_CONF) : libtool-ok config-stamp cpanp.mk
+	@echo Checking sanity of conf ...we see $(install-libLTLIBRARIES)
+ifeq (,$(strip $(NEED_ONLY_MKFP)))
+	@rm -f build-stamp # install-stamp
+endif
+	@echo 'REQUIRED FOR PerlMagick: $(if $(filter %libMagick.la,$(install-libLTLIBRARIES)),$(eval PPRQ:=$(shell sed <pm-targnames.mk -e 's;[^=]*=;;')),$(error target-prereqs for Perl not discovered!))'
+ifeq (,$(strip $(NEED_ONLY_MKFP)))
+	$(MAKE) -f Makefile $(PPRQ) && touch build-stamp
+endif
+	@echo $(if $(filter UNDEFINED,$(P_INSTALL_CONF)),$(error We have no valid def for P_INSTALL_CONF), Perl build starting ...)
+	cd ./PerlMagick && sleep 4 && perl Makefile.PL $(P_INSTALL_CONF)
+
+
+install-stamp install-4-perl :
+	$(SUDO) $(MAKE) -f Makefile $(addprefix install-,  \
+ configlibDATA configshareDATA libLTLIBRARIES codersLTLIBRARIES filtersLTLIBRARIES \
+ includeHEADERS magickincHEADERS includeHEADERS) \
+  && touch install-stamp
+
+
+ # Use override variables when invoking make; overriding that which is set in
+ # the PerlMagick/Makefile generated by PerlMagick/Makefile.PL
+ # We want to formulate the right strings for LD_RUN_PATH and for
+ # LDLOADLIBS.
+_V_ := $(strip $(shell sed -e '$(_sedfu)' cpanp.mk))
+_V_LDRP := $(addprefix -L,$(if $(_V_),$(_V_)/auto/Image/Magick/lib,$(error ERROR, no data for LD_RUN_PATH, must abort.)))
+_V_LDLL := $(strip -shared -L.. -L/usr/lib/X11 -Wl,--Bdynamic,--cref,--strip-debug,--trace \
+  $(_V_LDRP) -lMagick -lWand)
+ # -- ------------------------------------------------------------------------ -- #
+
+
+build-pm : cpanp.mk install-stamp $(PMB_CONF)
+	@if test -h ./PerlMagick/libperl.so; \
+         then :; else ln -vs $(PERL_ARCHIVE_SO) ./PerlMagick/libperl.so; fi;
+ifeq (install-pm,$(strip $(filter install-pm,$(MAKECMDGOALS))))
+	@echo INSTALLING I::M ...
+	cd ./PerlMagick && gmake LD_RUN_PATH='$(_V_)/auto/Image/Magick/lib' \
+  OPTIMIZE='-O2 -fpic -I..' LDLOADLIBS='$(_V_LDLL)' test install
+else
+	cd ./PerlMagick && gmake LD_RUN_PATH='$(_V_)/auto/Image/Magick/lib' \
+  OPTIMIZE='-O2 -fpic -I..' LDLOADLIBS='$(_V_LDLL)' test
+endif
+
+install-pm : build-pm
+	@echo Done.
+
+.FORCE :
+
+clean :
+	@$(SUDO) find ./PerlMagick -type f -exec chown somian.somian {} \;
+	@$(SUDO) test -f install-stamp && chown somian.somian install-stamp
+	@rm -vf *-stamp *.mk imagemagick-autoconf-cache
+	@$(MAKE) -f Makefile clean
+
+#-#-----------------------------------------------------------------------#-#
+ifeq (1,2)
+
+ /bin/bash ./libtool --silent   --mode=install /usr/bin/install -c  'magick/libMagick.la' '/usr/local/lib/libMagick.la'
+ /bin/bash ./libtool --silent   --mode=install /usr/bin/install -c  'wand/libWand.la' '/usr/local/lib/libWand.la'
+ /bin/bash ./libtool --silent   --mode=install /usr/bin/install -c  'Magick++/lib/libMagick++.la' '/usr/local/lib/libMagick++.la'
+
+
+NOTES: Perl install results insomething like this:
+Files found in blib/arch: installing files in blib/lib into architecture dependent library tree
+Installing /opt/cpan-installed/perl/module-lib/5.10/arch/i486-linux-gnu-thread-multi/auto/Image/Magick/Magick.bs
+Installing /opt/cpan-installed/perl/module-lib/5.10/arch/i486-linux-gnu-thread-multi/auto/Image/Magick/Magick.so
+Installing /opt/cpan-installed/perl/module-lib/5.10/arch/i486-linux-gnu-thread-multi/Image/Magick.pm
+Installing /opt/cpan-installed/perl/module-lib/5.10/arch/i486-linux-gnu-thread-multi/auto/Image/Magick/autosplit.ix
+Installing /opt/cpan-installed/perl/man/man3/Image::Magick.3pm
+Writing /opt/cpan-installed/perl/module-lib/5.10/arch/i486-linux-gnu-thread-multi/auto/Image/Magick/.packlist
+Appending installation info to /opt/cpan-installed/perl/module-lib/5.10/arch/i486-linux-gnu-thread-multi/perllocal.pod
+
+Here is an example in diff, of how the editing of PerlMagick/Makefile.PL.in works:
+
+47c47
+<    'ABSTRACT'	=> 'ImageMagick PERL Extension',
+---
+>    'ABSTRACT'	=> 'ImageMagick Perl Extension',
+62c62
+<    'INC'	=> '-I../ -I@top_srcdir@ @CPPFLAGS@',
+---
+>           q|INC|   => q|@CPPFLAGS@|,
+71c71
+<    'LDFLAGS'    =>  "-L../magick/.libs -lMagick -L../wand/.libs -lWand $Config{'ldflags'} @LDFLAGS@",
+---
+>       q|LDFLAGS|   => qq|-lmagick -lWand  @LDFLAGS@|,
+74c74
+<    'LDDLFLAGS'  => "-L../magick/.libs -lMagick -L../wand/.libs -lWand $Config{'lddlflags'} @LDFLAGS@",
+---
+>     q|LDDLFLAGS|   => qq|@MAGICK_LDFLAGS@|,
+80c80
+<    'LIBS'	=> [ '-L@MAGICKLIBDIR@ -L../magick/.libs -lMagick -L../wand/.libs -lWand' ],
+---
+>          q|LIBS|   => [ '@MAGICK_LDFLAGS@ -lMagick -lWand' ],
+
+endif
+
+
+
